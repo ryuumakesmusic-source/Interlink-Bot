@@ -11,6 +11,7 @@ from bs4 import BeautifulSoup
 import re
 from termcolor import colored
 import uuid
+import json
 
 # ─────────────────────────────────────────────
 #  UTILS
@@ -36,7 +37,6 @@ def format_time(seconds):
         return f"{s}s"
 
 def time_remaining_seconds(next_frame_ms):
-    """Convert next frame millisecond timestamp to seconds remaining"""
     current = get_timestamp()
     diff = (next_frame_ms - current) / 1000
     return max(0, int(diff))
@@ -79,17 +79,40 @@ def read_credentials():
                 parts = line.split('|')
                 if len(parts) >= 5:
                     accounts.append({
-                        "loginId":           parts[0].strip(),
-                        "passcode":          parts[1].strip(),
-                        "email":             parts[2].strip(),
+                        "loginId":            parts[0].strip(),
+                        "passcode":           parts[1].strip(),
+                        "email":              parts[2].strip(),
                         "gmail_app_password": parts[3].strip(),
-                        "groupId":           parts[4].strip()
+                        "groupId":            parts[4].strip()
                     })
                 else:
                     print(colored(f"  ⚠️  Line {line_num}: bad format, skipping.", 'red'))
         return accounts
     except Exception as e:
         print(colored(f"  ❌ Cannot read data.txt: {e}", 'red'))
+        return None
+
+# ─────────────────────────────────────────────
+#  SCHEDULE STORAGE
+#  Save/load next claim timestamps locally
+#  so we NEVER need to login just to check time
+# ─────────────────────────────────────────────
+
+def save_schedule(login_id, next_airdrop_ms, next_group_ms):
+    """Save next claim timestamps to disk"""
+    data = {
+        "next_airdrop_ms": next_airdrop_ms,
+        "next_group_ms":   next_group_ms
+    }
+    with open(f'schedule_{login_id}.json', 'w') as f:
+        json.dump(data, f)
+
+def load_schedule(login_id):
+    """Load saved next claim timestamps from disk"""
+    try:
+        with open(f'schedule_{login_id}.json', 'r') as f:
+            return json.load(f)
+    except FileNotFoundError:
         return None
 
 # ─────────────────────────────────────────────
@@ -109,37 +132,6 @@ def get_device_id(login_id):
     with open(filename, 'w') as f:
         f.write(did)
     return did
-
-# ─────────────────────────────────────────────
-#  TOKEN STORAGE
-# ─────────────────────────────────────────────
-
-def read_token(login_id):
-    try:
-        with open(f'token_{login_id}.txt', 'r') as f:
-            return f.read().strip()
-    except FileNotFoundError:
-        return None
-
-def save_token(login_id, token):
-    with open(f'token_{login_id}.txt', 'w') as f:
-        f.write(token)
-
-def delete_token(login_id):
-    path = f'token_{login_id}.txt'
-    if os.path.exists(path):
-        os.remove(path)
-
-def is_token_expired(token):
-    try:
-        decoded = jwt.decode(token, options={"verify_signature": False})
-        exp = decoded.get('exp')
-        if exp:
-            # expired if less than 5 min remaining
-            return exp * 1000 < (get_timestamp() + 300_000)
-        return True
-    except:
-        return True
 
 # ─────────────────────────────────────────────
 #  HEADERS
@@ -174,7 +166,7 @@ def fetch_otp(email_address, app_password, request_timestamp):
         imap = imaplib.IMAP4_SSL('imap.gmail.com')
         imap.login(email_address, app_password)
 
-        valid_otp        = None
+        valid_otp         = None
         latest_valid_time = 0
 
         for folder in ['INBOX', '"[Gmail]/Spam"']:
@@ -196,7 +188,7 @@ def fetch_otp(email_address, app_password, request_timestamp):
                     if email_ts < (request_timestamp - 180):
                         continue
 
-                    otp = None
+                    otp   = None
                     parts = msg.walk() if msg.is_multipart() else [msg]
                     for part in parts:
                         ct   = part.get_content_type()
@@ -204,10 +196,8 @@ def fetch_otp(email_address, app_password, request_timestamp):
                         if not body:
                             continue
                         body = body.decode('utf-8', errors='ignore')
-
                         if ct == 'text/html':
                             body = BeautifulSoup(body, 'html.parser').get_text()
-
                         m = re.search(r'\b\d{6}\b', body)
                         if m:
                             otp = m.group(0)
@@ -276,15 +266,11 @@ def api_verify_otp(account, otp, device_id):
         return None
 
 # ─────────────────────────────────────────────
-#  AUTHENTICATE  (login once → return token)
+#  AUTHENTICATE  (login → fresh token)
 # ─────────────────────────────────────────────
 
 def authenticate(account, device_id):
-    """
-    Full login flow.
-    Returns a fresh token string, or None on failure.
-    Logs into Gmail ONCE to grab the OTP.
-    """
+    """Login flow. Returns token or None."""
     print(colored("   🔐 Logging in...", 'yellow'))
 
     if not api_check_passcode(account, device_id):
@@ -307,18 +293,17 @@ def authenticate(account, device_id):
 
     print(colored(f"   📨 OTP: {otp}", 'cyan'))
 
-    resp = api_verify_otp(account, otp, device_id)
+    resp  = api_verify_otp(account, otp, device_id)
     token = resp and resp.get('data', {}).get('accessToken')
     if not token:
         print(colored("   ❌ OTP verification failed.", 'red'))
         return None
 
-    save_token(account['loginId'], token)
     print(colored("   ✅ Login successful!", 'green', attrs=['bold']))
     return token
 
 # ─────────────────────────────────────────────
-#  MINING APIS  (need valid token)
+#  MINING APIS
 # ─────────────────────────────────────────────
 
 def api_get_user_info(token, device_id):
@@ -369,65 +354,56 @@ def api_claim_group(token, device_id, group_id):
         return None
 
 # ─────────────────────────────────────────────
-#  PROCESS ONE ACCOUNT
-#  Returns: seconds until this account needs
-#           attention again (or None on hard fail)
+#  FIRST RUN  –  login to learn the schedule
 # ─────────────────────────────────────────────
 
-def process_account(account, idx, total):
-    login_id  = account['loginId']
-    email_addr = account['email']
-    group_id  = account.get('groupId', '')
+def first_run(account, device_id):
+    """
+    Login once, fetch user info + group info,
+    save next claim timestamps to disk.
+    Returns (next_airdrop_ms, next_group_ms) or None on failure.
+    """
+    login_id = account['loginId']
+    group_id = account.get('groupId', '')
 
-    # ── header ───────────────────────────────
-    print(colored(
-        f"\n╔══════════════════════════════════════════════════════════╗\n"
-        f"║  [{idx}/{total}]  {email_addr.ljust(49)}║\n"
-        f"╚══════════════════════════════════════════════════════════╝",
-        'cyan', attrs=['bold']
-    ))
-
-    device_id = get_device_id(login_id)
-
-    # ── get a valid token ─────────────────────
-    token = read_token(login_id)
-    if not token or is_token_expired(token):
-        token = authenticate(account, device_id)
-        if not token:
-            return None          # skip this account
-
-    # ── fetch user info (airdrop status) ─────
-    user_info = api_get_user_info(token, device_id)
-    if not user_info:
-        print(colored("   ❌ get_user_info failed – deleting token, will retry next cycle.", 'red'))
-        delete_token(login_id)
+    token = authenticate(account, device_id)
+    if not token:
         return None
 
-    data          = user_info.get('data', {})
-    ui            = data.get('userInfo', {})
-    tok           = data.get('token', {})
-    claimable     = data.get('isClaimable', {})
+    # ── airdrop schedule ──────────────────────
+    user_info = api_get_user_info(token, device_id)
+    if not user_info:
+        print(colored("   ❌ Could not fetch user info.", 'red'))
+        return None
 
-    print(colored(f"   👤 {ui.get('username')}  |  🪙 {tok.get('interlinkGoldTokenAmount', 0)} ITLG", 'white'))
+    data      = user_info.get('data', {})
+    ui        = data.get('userInfo', {})
+    tok       = data.get('token', {})
+    claimable = data.get('isClaimable', {})
 
-    # seconds until each claim window
-    next_airdrop_sec = time_remaining_seconds(claimable.get('nextFrame', 0))
-    next_group_sec   = None   # filled below
+    print(colored(
+        f"   👤 {ui.get('username')}  |  🪙 {tok.get('interlinkGoldTokenAmount', 0)} ITLG",
+        'white'
+    ))
 
-    # ── AIRDROP ──────────────────────────────
+    # If airdrop is already claimable, claim it now and schedule +4 h
+    next_airdrop_ms = 0
     print(colored("\n   ┌─ Solo Airdrop", 'yellow', attrs=['bold']))
     if claimable.get('isClaimable'):
-        print(colored("   │  🎯 Ready!  Claiming...", 'green'))
+        print(colored("   │  🎯 Ready! Claiming...", 'green'))
         if api_claim_airdrop(token, device_id):
             print(colored("   │  ✅ Airdrop claimed!", 'green', attrs=['bold']))
+            next_airdrop_ms = get_timestamp() + (4 * 3600 * 1000)
         else:
-            print(colored("   │  ❌ Claim failed.", 'red'))
-        # after a successful claim the server resets nextFrame to +4 h
-        next_airdrop_sec = 4 * 3600
+            print(colored("   │  ❌ Claim failed. Will retry next wake.", 'red'))
+            next_airdrop_ms = get_timestamp() + (5 * 60 * 1000)  # retry in 5 min
     else:
-        print(colored(f"   │  ⏰ Next in {format_time(next_airdrop_sec)}", 'cyan'))
+        next_airdrop_ms = claimable.get('nextFrame', get_timestamp() + 4 * 3600 * 1000)
+        secs = time_remaining_seconds(next_airdrop_ms)
+        print(colored(f"   │  ⏰ Next in {format_time(secs)}", 'cyan'))
 
-    # ── GROUP MINING ─────────────────────────
+    # ── group schedule ────────────────────────
+    next_group_ms = 0
     if group_id:
         print(colored("\n   ├─ Group Mining", 'magenta', attrs=['bold']))
         g_resp = api_check_group(token, device_id, group_id)
@@ -436,41 +412,118 @@ def process_account(account, idx, total):
             g = g_resp['data']
             print(colored(
                 f"   │  Group {g.get('groupId')}  │  {g.get('statusLabel')}  │  "
-                f"Reward: {g.get('totalReward')}", 'magenta'
+                f"Reward: {g.get('totalReward')}",
+                'magenta'
             ))
 
             if g.get('status') == "READY_TO_CLAIM":
-                print(colored("   │  🎯 Ready!  Claiming...", 'green'))
-                c_resp = api_claim_group(token, device_id, group_id)
-                if c_resp:
-                    cd = c_resp.get('data', {})
+                print(colored("   │  🎯 Ready! Claiming...", 'green'))
+                c = api_claim_group(token, device_id, group_id)
+                if c:
+                    cd = c.get('data', {})
                     print(colored("   │  ✅ Group claimed!", 'green', attrs=['bold']))
                     print(colored(
                         f"   │  💎 Reward {cd.get('totalReward')}  │  "
                         f"Claimable {cd.get('maxClaimable')}", 'yellow'
                     ))
-                    next_group_sec = 24 * 3600
+                    next_group_ms = get_timestamp() + (24 * 3600 * 1000)
                 else:
-                    print(colored("   │  ❌ Group claim failed.", 'red'))
+                    print(colored("   │  ❌ Claim failed. Will retry next wake.", 'red'))
+                    next_group_ms = get_timestamp() + (5 * 60 * 1000)
             else:
-                raw_next = g.get('nextTimeClaim', 0)
-                next_group_sec = time_remaining_seconds(raw_next) if raw_next > 0 else None
-                if next_group_sec is not None:
-                    print(colored(f"   │  ⏰ Next in {format_time(next_group_sec)}", 'cyan'))
+                raw = g.get('nextTimeClaim', 0)
+                next_group_ms = raw if raw > 0 else get_timestamp() + (24 * 3600 * 1000)
+                secs = time_remaining_seconds(next_group_ms)
+                print(colored(f"   │  ⏰ Next in {format_time(secs)}", 'cyan'))
         else:
             print(colored("   │  ⚠️  Could not fetch group info.", 'yellow'))
+            next_group_ms = get_timestamp() + (24 * 3600 * 1000)
 
     print(colored("   └─────────────────────────────────────────", 'cyan'))
 
-    # ── return how long until this account needs to wake up ──
-    candidates = [next_airdrop_sec]
-    if next_group_sec is not None:
-        candidates.append(next_group_sec)
+    # ── save schedule ─────────────────────────
+    save_schedule(login_id, next_airdrop_ms, next_group_ms)
+    print(colored(
+        f"\n   💾 Schedule saved.  "
+        f"Airdrop: {format_time(time_remaining_seconds(next_airdrop_ms))}  │  "
+        f"Group: {format_time(time_remaining_seconds(next_group_ms)) if next_group_ms else 'N/A'}",
+        'green'
+    ))
 
-    return min(candidates)   # seconds
+    return next_airdrop_ms, next_group_ms
 
 # ─────────────────────────────────────────────
-#  MAIN LOOP
+#  CLAIM RUN  –  wake up, login, claim, save new schedule
+# ─────────────────────────────────────────────
+
+def claim_run(account, device_id, which_airdrop, which_group):
+    """
+    Login once, claim whatever is due, save updated schedule.
+    which_airdrop / which_group = True means this claim is due now.
+    Returns updated (next_airdrop_ms, next_group_ms) or None on auth fail.
+    """
+    login_id = account['loginId']
+    group_id = account.get('groupId', '')
+
+    # Load current schedule from disk
+    schedule       = load_schedule(login_id) or {}
+    next_airdrop_ms = schedule.get('next_airdrop_ms', 0)
+    next_group_ms   = schedule.get('next_group_ms', 0)
+
+    token = authenticate(account, device_id)
+    if not token:
+        return None
+
+    # ── Airdrop ───────────────────────────────
+    print(colored("\n   ┌─ Solo Airdrop", 'yellow', attrs=['bold']))
+    if which_airdrop:
+        print(colored("   │  🎯 Claiming...", 'green'))
+        if api_claim_airdrop(token, device_id):
+            print(colored("   │  ✅ Airdrop claimed!", 'green', attrs=['bold']))
+            next_airdrop_ms = get_timestamp() + (4 * 3600 * 1000)
+        else:
+            print(colored("   │  ❌ Claim failed. Retry in 5 min.", 'red'))
+            next_airdrop_ms = get_timestamp() + (5 * 60 * 1000)
+    else:
+        secs = time_remaining_seconds(next_airdrop_ms)
+        print(colored(f"   │  ⏰ Not due yet. Next in {format_time(secs)}", 'cyan'))
+
+    # ── Group Mining ──────────────────────────
+    if group_id:
+        print(colored("\n   ├─ Group Mining", 'magenta', attrs=['bold']))
+        if which_group:
+            print(colored("   │  🎯 Claiming...", 'green'))
+            c = api_claim_group(token, device_id, group_id)
+            if c:
+                cd = c.get('data', {})
+                print(colored("   │  ✅ Group claimed!", 'green', attrs=['bold']))
+                print(colored(
+                    f"   │  💎 Reward {cd.get('totalReward')}  │  "
+                    f"Claimable {cd.get('maxClaimable')}", 'yellow'
+                ))
+                next_group_ms = get_timestamp() + (24 * 3600 * 1000)
+            else:
+                print(colored("   │  ❌ Claim failed. Retry in 5 min.", 'red'))
+                next_group_ms = get_timestamp() + (5 * 60 * 1000)
+        else:
+            secs = time_remaining_seconds(next_group_ms)
+            print(colored(f"   │  ⏰ Not due yet. Next in {format_time(secs)}", 'cyan'))
+
+    print(colored("   └─────────────────────────────────────────", 'cyan'))
+
+    # Save updated schedule
+    save_schedule(login_id, next_airdrop_ms, next_group_ms)
+    print(colored(
+        f"\n   💾 Schedule updated.  "
+        f"Airdrop: {format_time(time_remaining_seconds(next_airdrop_ms))}  │  "
+        f"Group: {format_time(time_remaining_seconds(next_group_ms)) if next_group_ms else 'N/A'}",
+        'green'
+    ))
+
+    return next_airdrop_ms, next_group_ms
+
+# ─────────────────────────────────────────────
+#  MAIN
 # ─────────────────────────────────────────────
 
 def main():
@@ -483,61 +536,130 @@ def main():
         return
 
     print(colored(
-        f"  ✨ {len(accounts)} account(s) loaded.\n"
-        f"  Logic: login once per cycle → read next-claim times → sleep until earliest.\n",
+        f"  ✨ {len(accounts)} account(s) loaded.\n",
         'green', attrs=['bold']
     ))
 
-    cycle = 0
+    # ── Step 1: first run for accounts with no saved schedule ──
+    print(colored("─" * 62, 'cyan'))
+    print(colored("  📋 Initialising schedules...", 'yellow', attrs=['bold']))
+    print(colored("─" * 62, 'cyan'))
+
+    for idx, account in enumerate(accounts, 1):
+        login_id  = account['loginId']
+        device_id = get_device_id(login_id)
+
+        print(colored(
+            f"\n╔══════════════════════════════════════════════════════════╗\n"
+            f"║  [{idx}/{len(accounts)}]  {account['email'].ljust(49)}║\n"
+            f"╚══════════════════════════════════════════════════════════╝",
+            'cyan', attrs=['bold']
+        ))
+
+        schedule = load_schedule(login_id)
+        if schedule:
+            a_secs = time_remaining_seconds(schedule['next_airdrop_ms'])
+            g_secs = time_remaining_seconds(schedule.get('next_group_ms', 0))
+            print(colored(
+                f"   ✅ Existing schedule found.\n"
+                f"   🪙 Airdrop in {format_time(a_secs)}  │  "
+                f"⛏️  Group in {format_time(g_secs)}",
+                'green'
+            ))
+        else:
+            print(colored("   ℹ️  No schedule found. Logging in to fetch...", 'yellow'))
+            first_run(account, device_id)
+
+        time.sleep(2)
+
+    # ── Step 2: main sleep → wake → claim loop ──
+    print(colored("\n" + "═" * 62, 'cyan', attrs=['bold']))
+    print(colored("  🚀 All schedules ready. Entering claim loop...", 'green', attrs=['bold']))
+    print(colored("═" * 62 + "\n", 'cyan', attrs=['bold']))
+
     while True:
         try:
-            cycle += 1
-            clear_terminal()
-            display_banner()
+            # Find the next wake-up time across ALL accounts
+            all_next_times = []
+
+            for account in accounts:
+                login_id = account['loginId']
+                schedule = load_schedule(login_id)
+                if not schedule:
+                    continue
+                all_next_times.append(schedule['next_airdrop_ms'])
+                g = schedule.get('next_group_ms', 0)
+                if g > 0:
+                    all_next_times.append(g)
+
+            if not all_next_times:
+                print(colored("  ⚠️  No schedules found. Re-initialising...", 'yellow'))
+                time.sleep(30)
+                continue
+
+            # Sleep until the earliest claim across all accounts
+            earliest_ms  = min(all_next_times)
+            sleep_secs   = max(0, int((earliest_ms - get_timestamp()) / 1000)) + 10
+            wake_at      = datetime.fromtimestamp(time.time() + sleep_secs).strftime('%Y-%m-%d %H:%M:%S')
 
             print(colored(
-                f"  🔄 Cycle #{cycle}  │  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}  │  "
-                f"{len(accounts)} account(s)",
+                f"  😴 Sleeping {format_time(sleep_secs)}  │  Wake at {wake_at}\n",
                 'yellow', attrs=['bold']
             ))
-            print(colored("─" * 62, 'cyan'))
 
-            sleep_candidates = []
-
-            for idx, account in enumerate(accounts, 1):
-                secs = process_account(account, idx, len(accounts))
-                if secs is not None and secs > 0:
-                    sleep_candidates.append(secs)
-                time.sleep(2)   # small gap between accounts
-
-            # ── decide how long to sleep ──────────────────
-            print(colored("\n" + "═" * 62, 'cyan', attrs=['bold']))
-
-            if sleep_candidates:
-                # wake up just when the earliest claim is ready (+10 s buffer)
-                sleep_for = min(sleep_candidates) + 10
-            else:
-                # something went wrong for all accounts – retry in 5 min
-                sleep_for = 300
-
-            wake_at = datetime.fromtimestamp(time.time() + sleep_for).strftime('%H:%M:%S')
-            print(colored(
-                f"  ✅ All done.  Sleeping {format_time(int(sleep_for))}  "
-                f"│  wake at {wake_at}",
-                'green', attrs=['bold']
-            ))
-            print(colored("═" * 62 + "\n", 'cyan', attrs=['bold']))
-
-            # countdown (print every 60 s so terminal isn't spammy)
-            remaining = int(sleep_for)
+            # Countdown
+            remaining = sleep_secs
             while remaining > 0:
                 print(colored(
-                    f"  ⏰  Next cycle in {format_time(remaining)} …",
+                    f"  ⏰  Next claim in {format_time(remaining)}   ",
                     'cyan'
                 ), end='\r')
                 chunk = min(60, remaining)
                 time.sleep(chunk)
                 remaining -= chunk
+
+            # ── Wake up ──────────────────────────────
+            clear_terminal()
+            display_banner()
+            now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            print(colored(f"  ⏰ Woke up at {now_str}", 'yellow', attrs=['bold']))
+            print(colored("─" * 62, 'cyan'))
+
+            now_ms = get_timestamp()
+
+            for idx, account in enumerate(accounts, 1):
+                login_id  = account['loginId']
+                device_id = get_device_id(login_id)
+                schedule  = load_schedule(login_id)
+
+                if not schedule:
+                    continue
+
+                next_airdrop_ms = schedule.get('next_airdrop_ms', 0)
+                next_group_ms   = schedule.get('next_group_ms', 0)
+
+                # Is anything due for this account?
+                airdrop_due = next_airdrop_ms <= now_ms
+                group_due   = next_group_ms > 0 and next_group_ms <= now_ms
+
+                if not airdrop_due and not group_due:
+                    # Nothing due for this account yet, skip
+                    continue
+
+                print(colored(
+                    f"\n╔══════════════════════════════════════════════════════════╗\n"
+                    f"║  [{idx}/{len(accounts)}]  {account['email'].ljust(49)}║\n"
+                    f"╚══════════════════════════════════════════════════════════╝",
+                    'cyan', attrs=['bold']
+                ))
+
+                # Login ONCE per account, claim everything due
+                claim_run(account, device_id, airdrop_due, group_due)
+                time.sleep(2)
+
+            print(colored("\n" + "═" * 62, 'cyan', attrs=['bold']))
+            print(colored("  ✅ Claim cycle done.", 'green', attrs=['bold']))
+            print(colored("═" * 62, 'cyan', attrs=['bold']))
 
         except KeyboardInterrupt:
             print(colored("\n\n  👋 Stopped by user. Bye!\n", 'yellow', attrs=['bold']))
